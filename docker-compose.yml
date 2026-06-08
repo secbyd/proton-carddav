@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  proton-sync:
+    build: .
+    restart: unless-stopped
+    environment:
+      BRIDGE_PASSWORD: "${BRIDGE_PASSWORD}"
+    volumes:
+      - ./auth.json:/data/auth.json:ro
+      - sync-cache:/data
+    command: daemon
+
+volumes:
+  sync-cache:
