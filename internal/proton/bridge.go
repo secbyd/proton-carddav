@@ -1,11 +1,20 @@
-// Package proton implements the ProtonMail contact adapter for the CardDAV bridge.
+// Package proton implements the ProtonMail contact adapter.
 //
-// ProtonMail stores contacts as signed/encrypted Card objects. This adapter:
-//  1. Calls go-proton-api to retrieve contacts.
-//  2. Decrypts and verifies each card with the user keyring via Cards.Merge.
-//  3. Serialises the merged vcard.Card to RFC 6350 vCard 4.0 bytes.
-//  4. On writes, encodes a ParsedVCard back into a signed Proton Card and
-//     calls CreateContacts / UpdateContact accordingly.
+// Key design decisions driven by the actual go-proton-api v0.4.0 types:
+//
+//  1. Two-factor auth: Auth.TwoFA.Enabled is a TwoFAStatus bitmask;
+//     HasTOTP (1<<0) indicates TOTP is required. The 2FA call takes
+//     Auth2FAReq{TwoFactorCode: code}.
+//
+//  2. Key unlock: there is no Keys.Unlock(salt, pass) helper. Instead:
+//       a. Call client.GetSalts() to obtain []Salt{ID, KeySalt}.
+//       b. Call salts.SaltForKey(mailboxPassword, primaryKeyID) to derive
+//          the salted key password using Proton's MailboxPassword KDF.
+//       c. Call proton.Unlock(user, addresses, saltedKeyPass) which returns
+//          (*crypto.KeyRing, map[string]*crypto.KeyRing, error).
+//
+//  3. Cards.Merge(*crypto.KeyRing) decrypts + verifies all card types and
+//     returns a merged vcard.Card ready for re-serialisation.
 package proton
 
 import (
@@ -23,36 +32,128 @@ import (
 	vcard "github.com/emersion/go-vcard"
 )
 
-// CardObject is the canonical per-contact representation used by the DAV layer.
+// ── Public types ──────────────────────────────────────────────────────────────
+
+// CardObject is the canonical per-contact representation used by the sync engine.
 type CardObject struct {
-	// UID is the stable vCard UID, also used as the filename base.
+	// UID is the stable vCard UID used as the filename base.
 	UID string
 	// Href is the per-resource filename, e.g. "<uid>.vcf".
 	Href string
 	// ETag is a double-quoted SHA-256 over the canonical vCard bytes.
 	ETag string
-	// VCard holds RFC 6350 vCard 4.0 bytes ready to serve over HTTP.
+	// VCard holds RFC 6350 vCard 4.0 bytes.
 	VCard []byte
-	// ProtonID is the Proton contact ID used in CRUD calls.
+	// ProtonID is the Proton-side contact ID used in CRUD calls.
 	ProtonID string
-	// ModifyTime is the server-side last-modification time.
+	// ModifyTime is the server-side last-modification timestamp.
 	ModifyTime time.Time
 }
 
-// ErrNotFound is returned when no matching card can be located.
+// ErrNotFound is returned when a card cannot be located by href.
 var ErrNotFound = errors.New("proton: card not found")
 
-// Bridge wraps an authenticated Proton API client and the user's keyring.
+// ── Bridge ────────────────────────────────────────────────────────────────────
+
+// Bridge holds an authenticated Proton API client and the user's primary keyring.
 type Bridge struct {
 	client  *protonapi.Client
 	keyring *crypto.KeyRing
 }
 
-// NewBridge constructs a Bridge from an already-authenticated client and
-// the user's unlocked primary keyring.
+// NewClientAndBridge performs full SRP login, optional TOTP 2FA, key-salt
+// derivation, and keyring unlock. It returns a ready-to-use Bridge.
+//
+// Parameters:
+//   - username     Proton account username
+//   - password     Proton login password
+//   - mboxPass     Mailbox password (pass empty string for single-password mode)
+//   - otpFn        Called when Proton requires TOTP; may be nil in daemon mode
+//     (will fail if 2FA is actually required when nil)
+func NewClientAndBridge(
+	ctx context.Context,
+	username, password, mboxPass string,
+	otpFn func() string,
+) (*Bridge, error) {
+	m := protonapi.New(
+		protonapi.WithHostURL("https://mail.proton.me"),
+		protonapi.WithAppVersion("Other/1.0"),
+	)
+
+	// ── Step 1: SRP login ──
+	c, auth, err := m.NewClientWithLogin(ctx, username, []byte(password))
+	if err != nil {
+		return nil, fmt.Errorf("proton: SRP login: %w", err)
+	}
+
+	// ── Step 2: TOTP 2FA (if required) ──
+	// auth.TwoFA.Enabled is a bitmask: HasTOTP = 1<<0, HasFIDO2 = 1<<1.
+	if auth.TwoFA.Enabled&protonapi.HasTOTP != 0 {
+		if otpFn == nil {
+			return nil, errors.New("proton: TOTP required but no OTP function provided")
+		}
+		if err := c.Auth2FA(ctx, protonapi.Auth2FAReq{
+			TwoFactorCode: otpFn(),
+		}); err != nil {
+			return nil, fmt.Errorf("proton: 2FA: %w", err)
+		}
+	}
+
+	// ── Step 3: Fetch user + addresses ──
+	user, err := c.GetUser(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("proton: get user: %w", err)
+	}
+	if len(user.Keys) == 0 {
+		return nil, errors.New("proton: user has no keys")
+	}
+
+	addresses, err := c.GetAddresses(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("proton: get addresses: %w", err)
+	}
+
+	// ── Step 4: Derive salted mailbox password ──
+	// In single-password mode, the mailbox password equals the login password.
+	if mboxPass == "" {
+		mboxPass = password
+	}
+
+	salts, err := c.GetSalts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("proton: get salts: %w", err)
+	}
+
+	// SaltForKey uses the primary key ID to look up the correct salt entry
+	// and applies Proton's bcrypt-derived MailboxPassword KDF.
+	saltedPass, err := salts.SaltForKey([]byte(mboxPass), user.Keys[0].ID)
+	if err != nil {
+		return nil, fmt.Errorf("proton: salt key pass: %w", err)
+	}
+
+	// ── Step 5: Unlock keyring ──
+	// proton.Unlock returns the user keyring and per-address keyrings.
+	// We only need the user keyring for contact decryption.
+	userKR, _, err := protonapi.Unlock(user, addresses, saltedPass)
+	if err != nil {
+		return nil, fmt.Errorf("proton: unlock keyring: %w", err)
+	}
+
+	return &Bridge{client: c, keyring: userKR}, nil
+}
+
+// NewBridge constructs a Bridge from an already-authenticated client and keyring.
+// Use this when restoring a session from stored credentials.
 func NewBridge(client *protonapi.Client, keyring *crypto.KeyRing) *Bridge {
 	return &Bridge{client: client, keyring: keyring}
 }
+
+// Close logs out the authenticated session.
+func (b *Bridge) Close(ctx context.Context) {
+	_ = b.client.AuthDelete(ctx)
+}
+
+// ── Read operations ───────────────────────────────────────────────────────────
 
 // ListCards returns all ProtonMail contacts as CardObjects.
 func (b *Bridge) ListCards(ctx context.Context) ([]CardObject, error) {
@@ -64,7 +165,7 @@ func (b *Bridge) ListCards(ctx context.Context) ([]CardObject, error) {
 	for _, c := range contacts {
 		obj, err := b.contactToCardObject(c)
 		if err != nil {
-			// Skip broken/unreadable contacts; a real deployment should log here.
+			// Skip unreadable contacts rather than aborting the whole sync.
 			continue
 		}
 		out = append(out, obj)
@@ -72,9 +173,7 @@ func (b *Bridge) ListCards(ctx context.Context) ([]CardObject, error) {
 	return out, nil
 }
 
-// GetCardByHref locates a card by its filename (e.g. "abc123.vcf").
-// It fetches the full list and does a linear scan.
-// A production implementation should maintain an in-memory index.
+// GetCardByHref locates a card by its href filename (e.g. "abc123.vcf").
 func (b *Bridge) GetCardByHref(ctx context.Context, href string) (CardObject, error) {
 	cards, err := b.ListCards(ctx)
 	if err != nil {
@@ -88,6 +187,8 @@ func (b *Bridge) GetCardByHref(ctx context.Context, href string) (CardObject, er
 	return CardObject{}, ErrNotFound
 }
 
+// ── Write operations ──────────────────────────────────────────────────────────
+
 // UpsertCardByVCard creates or replaces a contact from raw vCard bytes.
 // Returns (obj, created, error); created is true when a new contact was made.
 func (b *Bridge) UpsertCardByVCard(ctx context.Context, href string, raw []byte) (CardObject, bool, error) {
@@ -99,7 +200,7 @@ func (b *Bridge) UpsertCardByVCard(ctx context.Context, href string, raw []byte)
 	existing, lookupErr := b.GetCardByHref(ctx, href)
 
 	if lookupErr == nil {
-		// ── UPDATE ──
+		// Contact already exists on Proton — update it.
 		cards, err := b.buildProtonCards(vc)
 		if err != nil {
 			return CardObject{}, false, fmt.Errorf("proton: build cards for update: %w", err)
@@ -115,7 +216,7 @@ func (b *Bridge) UpsertCardByVCard(ctx context.Context, href string, raw []byte)
 		return obj, false, nil
 	}
 
-	// ── CREATE ──
+	// Contact does not exist — create it.
 	cards, err := b.buildProtonCards(vc)
 	if err != nil {
 		return CardObject{}, false, fmt.Errorf("proton: build cards for create: %w", err)
@@ -138,7 +239,7 @@ func (b *Bridge) UpsertCardByVCard(ctx context.Context, href string, raw []byte)
 	return obj, true, nil
 }
 
-// DeleteCardByHref removes the contact whose Href matches.
+// DeleteCardByHref removes the contact identified by href.
 func (b *Bridge) DeleteCardByHref(ctx context.Context, href string) error {
 	card, err := b.GetCardByHref(ctx, href)
 	if err != nil {
@@ -147,75 +248,67 @@ func (b *Bridge) DeleteCardByHref(ctx context.Context, href string) error {
 	return b.client.DeleteContacts(ctx, protonapi.DeleteContactsReq{IDs: []string{card.ProtonID}})
 }
 
-// ── private helpers ───────────────────────────────────────────────────────────
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 // contactToCardObject converts a protonapi.Contact into a CardObject by
-// decrypting/verifying all card blocks via Cards.Merge and serialising the
-// resulting vcard.Card to RFC 6350 bytes.
-func (b *Bridge) contactToCardObject(c protonapi.Contact) (CardObject, error) {
-	// Cards.Merge decrypts encrypted card blocks and verifies signatures,
-	// then merges them into a single vcard.Card — this is the canonical
-	// way go-proton-api exposes decrypted contact content.
-	merged, err := c.Cards.Merge(b.keyring)
+// decrypting/verifying all card types and serialising to vCard 4.0 bytes.
+func (b *Bridge) contactToCardObject(pc protonapi.Contact) (CardObject, error) {
+	// Cards.Merge decrypts encrypted cards and verifies signed cards using
+	// the provided keyring, then merges all card types into one vcard.Card.
+	merged, err := pc.Cards.Merge(b.keyring)
 	if err != nil {
-		return CardObject{}, fmt.Errorf("proton: merge cards for %s: %w", c.ID, err)
+		return CardObject{}, fmt.Errorf("proton: merge cards for %s: %w", pc.ID, err)
 	}
 
-	// Determine a stable UID: prefer the vCard UID field, then Proton's UID
-	// field, finally fall back to the opaque contact ID.
-	uidStr := ""
+	// Resolve UID: prefer the vCard UID field, then the Proton metadata UID,
+	// then fall back to the Proton contact ID.
+	uid := ""
 	if f := merged.Get(vcard.FieldUID); f != nil {
-		uidStr = f.Value
+		uid = f.Value
 	}
-	if uidStr == "" {
-		uidStr = c.UID
+	if uid == "" {
+		uid = pc.UID
 	}
-	if uidStr == "" {
-		uidStr = c.ID
+	if uid == "" {
+		uid = pc.ID
 	}
-	uidStr = sanitiseUID(uidStr)
+	uid = sanitiseUID(uid)
 
-	// Always embed the UID so clients can round-trip it.
+	// Ensure the merged card carries a UID field before serialisation.
 	if merged.Get(vcard.FieldUID) == nil {
-		merged.SetValue(vcard.FieldUID, uidStr)
+		merged.SetValue(vcard.FieldUID, uid)
 	}
 
 	vcBytes, err := encodeVCard(merged)
 	if err != nil {
-		return CardObject{}, fmt.Errorf("proton: encode vcard %s: %w", c.ID, err)
+		return CardObject{}, fmt.Errorf("proton: encode vcard for %s: %w", pc.ID, err)
 	}
 
 	return CardObject{
-		UID:        uidStr,
-		Href:       uidStr + ".vcf",
+		UID:        uid,
+		Href:       uid + ".vcf",
 		ETag:       etagOf(vcBytes),
 		VCard:      vcBytes,
-		ProtonID:   c.ID,
-		ModifyTime: time.Unix(c.ModifyTime, 0),
+		ProtonID:   pc.ID,
+		ModifyTime: time.Unix(pc.ModifyTime, 0),
 	}, nil
 }
 
-// buildProtonCards converts a vcard.Card into the signed Proton card set
-// required by CreateContacts / UpdateContact.
-// We produce a single CardTypeSigned card containing the full vCard text.
-// Sensitive per-contact data (PGP keys, etc.) would go in a separate
-// CardTypeEncryptedAndSigned block if needed.
+// buildProtonCards encodes a vcard.Card into Proton's signed card format.
+// The card is stored as CardTypeSigned so that Proton can verify its integrity.
 func (b *Bridge) buildProtonCards(vc vcard.Card) (protonapi.Cards, error) {
 	vcBytes, err := encodeVCard(vc)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encode vcard for signing: %w", err)
 	}
-
-	// Sign the vCard text with the user's primary key.
 	sig, err := b.keyring.SignDetached(crypto.NewPlainMessageFromString(string(vcBytes)))
 	if err != nil {
-		return nil, fmt.Errorf("proton: sign card data: %w", err)
+		return nil, fmt.Errorf("sign card: %w", err)
 	}
 	armoredSig, err := sig.GetArmored()
 	if err != nil {
-		return nil, fmt.Errorf("proton: armor signature: %w", err)
+		return nil, fmt.Errorf("armor signature: %w", err)
 	}
-
 	return protonapi.Cards{
 		&protonapi.Card{
 			Type:      protonapi.CardTypeSigned,
@@ -225,11 +318,16 @@ func (b *Bridge) buildProtonCards(vc vcard.Card) (protonapi.Cards, error) {
 	}, nil
 }
 
+// parseVCard decodes raw vCard bytes into a vcard.Card.
 func parseVCard(raw []byte) (vcard.Card, error) {
-	dec := vcard.NewDecoder(bytes.NewReader(raw))
-	return dec.Decode()
+	card, err := vcard.NewDecoder(bytes.NewReader(raw)).Decode()
+	if err != nil {
+		return nil, fmt.Errorf("parse vcard: %w", err)
+	}
+	return card, nil
 }
 
+// encodeVCard serialises a vcard.Card to RFC 6350 bytes.
 func encodeVCard(vc vcard.Card) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := vcard.NewEncoder(&buf).Encode(vc); err != nil {
@@ -238,11 +336,13 @@ func encodeVCard(vc vcard.Card) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// etagOf returns a double-quoted SHA-256 hex string over b.
 func etagOf(b []byte) string {
 	sum := sha256.Sum256(b)
 	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
+// sanitiseUID replaces characters that are invalid in URL path segments.
 func sanitiseUID(uid string) string {
 	return strings.NewReplacer("/", "-", " ", "-", ":", "-").Replace(uid)
 }
