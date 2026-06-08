@@ -51,16 +51,22 @@ Prompts for:
 
 | Prompt | Description |
 |---|---|
-| ProtonMail username | your `@proton.me` address |
-| ProtonMail account password | SRP login password |
-| ProtonMail mailbox password | only in two-password mode; leave blank otherwise |
+| ProtonMail username | your `@proton.me` or custom domain address |
+| ProtonMail account password | the password you use to log in to proton.me |
 | Synology CardDAV URL | e.g. `https://nas.example.org:5006` |
 | Synology username | local DSM account with CardDAV access |
 | Synology password | |
 | Address book path | e.g. `/carddav/principal/addressbooks/proton/` |
 
-At the end a **bridge password** is generated and printed once. Save it
-securely — it is the only key that unlocks `auth.json`.
+> **Note — two-password mode:** A small number of older Proton accounts
+> use a separate *mailbox password* to decrypt the private key (distinct
+> from the login password). If you have never heard of this, you do not
+> have it. The bootstrap will also ask for it; leave that prompt blank
+> and it is ignored.
+
+At the end a **bridge password** is generated and printed **once**.
+Save it securely — it is the AES-256-GCM key for `auth.json` and
+cannot be recovered.
 
 ```
 auth.json layout (on disk, encrypted):
@@ -80,16 +86,42 @@ export BRIDGE_PASSWORD=<generated value>
 
 Or enter it interactively when prompted.
 
-### 4. Sync once (test)
+### 4. Handle two-factor authentication (TOTP)
+
+If your Proton account has **2FA enabled**, a one-time code is required
+every time `sync` or `daemon` starts — it is needed to authenticate the
+Proton session, not during the initial `auth` bootstrap.
+
+Supply the TOTP code in one of two ways:
+
+```bash
+# Option A — environment variable (recommended for automated/daemon use)
+export PROTON_TOTP=$(your-totp-generator)
+./proton-sync daemon
+
+# Option B — interactive prompt (default when PROTON_TOTP is not set)
+./proton-sync sync
+# TOTP code: 123456
+```
+
+For unattended daemon use, generate the TOTP from a CLI tool such as
+`oathtool` or `pass otp` and inject it via the env var:
+
+```bash
+export PROTON_TOTP=$(oathtool --totp -b "$PROTON_TOTP_SECRET")
+./proton-sync daemon
+```
+
+### 5. Sync once (test)
 
 ```bash
 ./proton-sync sync
 ```
 
-### 5. Run as daemon
+### 6. Run as daemon
 
 ```bash
-./proton-sync daemon   # interval = sync_interval_sec from config (default 300s)
+./proton-sync daemon   # interval = sync_interval_sec from config (default 300 s)
 ```
 
 ---
@@ -123,7 +155,8 @@ Other policies via `conflict_policy` in the encrypted config:
 ./proton-sync auth
 
 # Run the daemon:
-BRIDGE_PASSWORD=<value> docker compose up -d
+BRIDGE_PASSWORD=<value> PROTON_TOTP=$(oathtool --totp -b "$SECRET") \
+  docker compose up -d
 ```
 
 The container mounts `auth.json` read-only and persists `sync-cache.db`
@@ -135,7 +168,8 @@ in a named Docker volume.
 
 | Variable | Required | Description |
 |---|---|---|
-| `BRIDGE_PASSWORD` | yes (or prompted) | Unlocks `auth.json` |
+| `BRIDGE_PASSWORD` | yes (or prompted) | Unlocks `auth.json`; generated once during `proton-sync auth` |
+| `PROTON_TOTP` | if 2FA enabled | Current TOTP one-time code. Read at `sync`/`daemon` startup. If unset and 2FA is active, the user is prompted interactively. |
 
 All other credentials live encrypted inside `auth.json`.
 
@@ -152,7 +186,7 @@ All other credentials live encrypted inside `auth.json`.
 | Updated on both (conflict) | Duplicated with conflict suffix on both sides |
 | Deleted on Proton | Deleted from Synology |
 | Deleted on Synology | Deleted from Proton |
-| First run (empty cache) | Full push Proton -> Synology; pull Synology-only contacts |
+| First run (empty cache) | Full push Proton → Synology; pull Synology-only contacts |
 
 ---
 
@@ -160,8 +194,10 @@ All other credentials live encrypted inside `auth.json`.
 
 - `auth.json` is AES-256-GCM encrypted. Key derived with scrypt
   (`N=32768, r=8, p=1`) from the bridge password.
-- Decrypted keyring is held in memory only during each sync pass.
-- TOTP/2FA is handled interactively during `auth` bootstrap only.
+- Decrypted credentials are held in memory only; never written to disk
+  in plaintext.
+- TOTP/2FA is evaluated at `sync`/`daemon` start (Proton session
+  establishment). Supply via `PROTON_TOTP` for non-interactive use.
 - No network port is exposed — the daemon only makes outbound connections.
 - The Synology CardDAV URL should use HTTPS.
 
