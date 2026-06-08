@@ -1,133 +1,205 @@
-// proton-carddav is a single-user RFC 6352 CardDAV bridge for ProtonMail.
+// proton-sync is a bidirectional sync daemon between ProtonMail contacts
+// and a Synology CardDAV server.
 //
-// Usage:
+// Commands:
 //
-//	export PROTON_USERNAME=you@proton.me
-//	export PROTON_PASSWORD=yourpassword
-//	export PROTON_MBOX_PASSWORD=yourmailboxpassword   # two-password mode only
-//	export CARDDAV_BASE_URL=https://carddav.example.org
-//	export CARDDAV_LISTEN=:8080
-//	export CARDDAV_BASIC_USER=dav
-//	export CARDDAV_BASIC_PASS=secret
-//	proton-carddav
+//	proton-sync auth    – interactive bootstrap: SRP login + OTP + encrypted auth.json
+//	proton-sync sync    – run one sync cycle and exit
+//	proton-sync daemon  – run sync on an interval until SIGTERM
 //
-// TLS is handled by a reverse proxy (nginx, Caddy, Traefik). Never expose plain HTTP.
+// All credentials are stored in auth.json, encrypted with AES-256-GCM
+// derived from a generated bridge password (printed once at bootstrap).
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	protonapi "github.com/ProtonMail/go-proton-api"
-
-	"github.com/secbyd/proton-carddav/internal/dav"
+	"github.com/secbyd/proton-carddav/internal/auth"
 	protonbridge "github.com/secbyd/proton-carddav/internal/proton"
+	"github.com/secbyd/proton-carddav/internal/sync"
 )
 
+const defaultInterval = 5 * time.Minute
+
 func main() {
+	if len(os.Args) < 2 {
+		usage()
+	}
+
+	switch os.Args[1] {
+	case "auth":
+		cmdAuth()
+	case "sync":
+		cmdSync()
+	case "daemon":
+		cmdDaemon()
+	default:
+		usage()
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: proton-sync <auth|sync|daemon>")
+	os.Exit(1)
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+
+// cmdAuth runs the interactive bootstrap:
+//  1. Prompt Proton + Synology credentials
+//  2. Test Proton login (with OTP if needed)
+//  3. Generate a bridge password
+//  4. Encrypt and persist auth.json
+func cmdAuth() {
+	cfg, bridgePass, err := auth.Bootstrap()
+	if err != nil {
+		log.Fatalf("auth: %v", err)
+	}
+	if err := auth.Save("auth.json", cfg, bridgePass); err != nil {
+		log.Fatalf("auth save: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("auth.json written. Your bridge password (store securely):")
+	fmt.Println()
+	fmt.Println(" ", bridgePass)
+	fmt.Println()
+	fmt.Println("Set BRIDGE_PASSWORD=<above> before running sync or daemon.")
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+
+func cmdSync() {
 	cfg := loadConfig()
+	ctx := context.Background()
+
+	engine, err := buildEngine(ctx, cfg)
+	if err != nil {
+		log.Fatalf("sync: build engine: %v", err)
+	}
+	defer engine.Close()
+
+	if err := engine.SyncOnce(ctx); err != nil {
+		log.Fatalf("sync: %v", err)
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+
+func cmdDaemon() {
+	cfg := loadConfig()
+
+	interval := defaultInterval
+	if s := os.Getenv("SYNC_INTERVAL_SECONDS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			interval = time.Duration(n) * time.Second
+		}
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	log.Printf("proton-carddav: authenticating as %s", cfg.protonUser)
-	client, kr, err := loginProton(ctx, cfg)
+	engine, err := buildEngine(ctx, cfg)
 	if err != nil {
-		log.Fatalf("proton-carddav: login failed: %v", err)
+		log.Fatalf("daemon: build engine: %v", err)
 	}
-	defer client.AuthDelete(context.Background()) //nolint:errcheck
+	defer engine.Close()
 
-	bridge := protonbridge.NewBridge(client, kr)
-	davServer := dav.NewServer(cfg.baseURL, bridge)
+	log.Printf("daemon: starting, sync interval %s", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	var handler http.Handler = davServer
-	if cfg.basicUser != "" {
-		handler = basicAuth(cfg.basicUser, cfg.basicPass, davServer)
-	}
-
-	srv := &http.Server{
-		Addr:         cfg.listen,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+	// Run immediately on start.
+	if err := engine.SyncOnce(ctx); err != nil {
+		log.Printf("daemon: sync error: %v", err)
 	}
 
-	go func() {
-		log.Printf("proton-carddav: listening on %s", cfg.listen)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("proton-carddav: serve: %v", err)
+	for {
+		select {
+		case <-ticker.C:
+			if err := engine.SyncOnce(ctx); err != nil {
+				log.Printf("daemon: sync error: %v", err)
+			}
+		case <-ctx.Done():
+			log.Println("daemon: shutting down")
+			return
 		}
-	}()
-
-	<-ctx.Done()
-	log.Println("proton-carddav: shutting down")
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutCancel()
-	_ = srv.Shutdown(shutCtx)
+	}
 }
 
-// loginProton authenticates with Proton and unlocks the user keyring.
-// Handles both one-password and two-password modes.
-func loginProton(ctx context.Context, cfg config) (*protonapi.Client, interface{ /* *crypto.KeyRing */ }, error) {
-	m := protonapi.New(
-		protonapi.WithHostURL("https://mail.proton.me"),
-		protonapi.WithAppVersion("Other/1.0"),
-	)
+// ───────────────────────────────────────────────────────────────────────────────
 
-	c, auth, err := m.NewClientWithLogin(ctx, cfg.protonUser, []byte(cfg.protonPass))
-	if err != nil {
-		return nil, nil, fmt.Errorf("login: %w", err)
-	}
-
-	user, err := c.GetUser(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("get user: %w", err)
-	}
-
-	// In one-password mode the mailbox password equals the account password.
-	mboxPass := cfg.protonMboxPass
-	if mboxPass == "" {
-		mboxPass = cfg.protonPass
-	}
-
-	kr, err := user.Keys.Unlock(auth.KeySalt, []byte(mboxPass))
-	if err != nil {
-		return nil, nil, fmt.Errorf("unlock keyring: %w", err)
-	}
-
-	return c, kr, nil
-}
-
-// ── config ────────────────────────────────────────────────────────────────────
-
-type config struct {
-	protonUser     string
-	protonPass     string
+type appConfig struct {
+	protonUsername string
+	protonPassword string
 	protonMboxPass string
-	baseURL        string
-	listen         string
-	basicUser      string
-	basicPass      string
+	synologyURL     string
+	synologyBook    string
+	synologyUser    string
+	synologyPass    string
+	conflictPolicy  string
+	bridgePass      string
+	authFile        string
 }
 
-func loadConfig() config {
-	return config{
-		protonUser:     mustEnv("PROTON_USERNAME"),
-		protonPass:     mustEnv("PROTON_PASSWORD"),
-		protonMboxPass: os.Getenv("PROTON_MBOX_PASSWORD"),
-		baseURL:        envOr("CARDDAV_BASE_URL", "http://localhost:8080"),
-		listen:         envOr("CARDDAV_LISTEN", ":8080"),
-		basicUser:      os.Getenv("CARDDAV_BASIC_USER"),
-		basicPass:      os.Getenv("CARDDAV_BASIC_PASS"),
+func loadConfig() *appConfig {
+	// Prefer encrypted auth.json when BRIDGE_PASSWORD is set.
+	bridgePass := os.Getenv("BRIDGE_PASSWORD")
+	authFile := envOr("AUTH_FILE", "auth.json")
+
+	if bridgePass != "" {
+		cfg, err := auth.Load(authFile, bridgePass)
+		if err != nil {
+			log.Fatalf("load auth.json: %v", err)
+		}
+		return &appConfig{
+			protonUsername: cfg.ProtonUsername,
+			protonPassword: cfg.ProtonPassword,
+			protonMboxPass: cfg.ProtonMboxPass,
+			synologyURL:     cfg.SynologyURL,
+			synologyBook:    cfg.SynologyAddressbookPath,
+			synologyUser:    cfg.SynologyUsername,
+			synologyPass:    cfg.SynologyPassword,
+			conflictPolicy:  cfg.ConflictPolicy,
+		}
 	}
+
+	// Fall back to environment variables.
+	return &appConfig{
+		protonUsername: mustEnv("PROTON_USERNAME"),
+		protonPassword: mustEnv("PROTON_PASSWORD"),
+		protonMboxPass: os.Getenv("PROTON_MBOX_PASSWORD"),
+		synologyURL:     mustEnv("SYNOLOGY_CARDDAV_URL"),
+		synologyBook:    mustEnv("SYNOLOGY_ADDRESSBOOK_PATH"),
+		synologyUser:    mustEnv("SYNOLOGY_USERNAME"),
+		synologyPass:    mustEnv("SYNOLOGY_PASSWORD"),
+		conflictPolicy:  envOr("CONFLICT_POLICY", "duplicate"),
+	}
+}
+
+// buildEngine authenticates with Proton (using NewClientAndBridge which
+// handles SRP, OTP, salt derivation, and keyring unlock internally) and
+// returns a ready Engine.
+func buildEngine(ctx context.Context, cfg *appConfig) (*sync.Engine, error) {
+	bridge, err := protonbridge.NewClientAndBridge(
+		ctx,
+		cfg.protonUsername,
+		cfg.protonPassword,
+		cfg.protonMboxPass,
+		nil, // OTP not used in daemon mode; credentials from auth.json
+	)
+	if err != nil {
+		return nil, fmt.Errorf("proton auth: %w", err)
+	}
+
+	return sync.NewEngine(bridge, cfg.synologyURL, cfg.synologyBook,
+		cfg.synologyUser, cfg.synologyPass, cfg.conflictPolicy), nil
 }
 
 func mustEnv(key string) string {
@@ -143,17 +215,4 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
-}
-
-// basicAuth wraps a handler with HTTP Basic Authentication.
-func basicAuth(user, pass string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, p, ok := r.BasicAuth()
-		if !ok || u != user || p != pass {
-			w.Header().Set("WWW-Authenticate", `Basic realm="ProtonMail CardDAV"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }
