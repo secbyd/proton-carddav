@@ -1,11 +1,11 @@
 // Package sync implements the bidirectional sync engine between a Proton
 // Bridge and a Synology CardDAV server.
 //
-// Conflict policy: "duplicate" (default)
-//   When both sides changed the same UID since the last sync, both versions
-//   are preserved.  The Synology copy gets a new UID with suffix
-//   "-conflict-proton" appended to FN; the Proton copy gets
-//   "-conflict-synology".  Both are written back to both sides.
+// Conflict policy (set in auth.json or via ConflictPolicy field):
+//
+//	"duplicate"      (default) — preserve both versions with a suffix UID
+//	"proton-wins"    — Proton version overwrites Synology on conflict
+//	"synology-wins"  — Synology version overwrites Proton on conflict
 package sync
 
 import (
@@ -13,11 +13,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
 	vcard "github.com/emersion/go-vcard"
 
+	"github.com/secbyd/proton-carddav/internal/auth"
 	"github.com/secbyd/proton-carddav/internal/cache"
 	"github.com/secbyd/proton-carddav/internal/proton"
 	"github.com/secbyd/proton-carddav/internal/synology"
@@ -31,36 +33,78 @@ type Engine struct {
 	policy   string
 }
 
-// NewEngine constructs an Engine from an already-authenticated Proton Bridge
-// plus Synology CardDAV credentials. The Bridge is created by the caller via
-// proton.NewClientAndBridge so that OTP prompting happens at the right layer.
-func NewEngine(
+// NewEngine authenticates with ProtonMail, opens the local sync cache, and
+// returns a ready Engine. It is the constructor used by cmd/proton-sync.
+//
+// Authentication uses proton.NewClientAndBridge which implements the correct
+// Proton SRP -> TOTP -> GetSalts -> SaltForKey -> Unlock sequence.
+// TOTP is read from the PROTON_TOTP environment variable when set; otherwise
+// the user is prompted interactively.
+func NewEngine(ctx context.Context, cfg *auth.Config) (*Engine, error) {
+	otpFn := func() string {
+		if v := os.Getenv("PROTON_TOTP"); v != "" {
+			return v
+		}
+		fmt.Print("TOTP code: ")
+		var code string
+		fmt.Scanln(&code) //nolint:errcheck
+		return code
+	}
+
+	bridge, err := proton.NewClientAndBridge(
+		ctx,
+		cfg.ProtonUsername,
+		cfg.ProtonPassword,
+		cfg.ProtonMboxPass,
+		otpFn,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("proton auth: %w", err)
+	}
+
+	policy := cfg.ConflictPolicy
+	if policy == "" {
+		policy = "duplicate"
+	}
+
+	engine, err := newEngineFromBridge(
+		bridge,
+		cfg.SynologyURL,
+		cfg.SynologyAddressbookPath,
+		cfg.SynologyUsername,
+		cfg.SynologyPassword,
+		policy,
+	)
+	if err != nil {
+		bridge.Close(ctx)
+		return nil, err
+	}
+	return engine, nil
+}
+
+// newEngineFromBridge constructs an Engine from an already-authenticated Bridge.
+// Used internally and in tests.
+func newEngineFromBridge(
 	bridge *proton.Bridge,
 	synologyURL, synologyBook, synologyUser, synologyPass string,
 	conflictPolicy string,
-) *Engine {
+) (*Engine, error) {
 	sc := synology.NewClient(synologyURL, synologyBook, synologyUser, synologyPass)
 
 	db, err := cache.Open("sync-cache.db")
 	if err != nil {
-		// Cache open failure is fatal: we cannot detect conflicts without it.
-		panic(fmt.Sprintf("cache open: %v", err))
-	}
-
-	policy := conflictPolicy
-	if policy == "" {
-		policy = "duplicate"
+		return nil, fmt.Errorf("cache open: %w", err)
 	}
 
 	return &Engine{
 		proton:   bridge,
 		synology: sc,
 		cache:    db,
-		policy:   policy,
-	}
+		policy:   conflictPolicy,
+	}, nil
 }
 
-// Close releases the cache DB handle and logs out from Proton.
+// Close releases the cache DB handle and logs out the Proton session.
 func (e *Engine) Close() {
 	e.cache.Close()
 	e.proton.Close(context.Background())
@@ -69,7 +113,6 @@ func (e *Engine) Close() {
 // SyncOnce performs one full bidirectional sync cycle.
 func (e *Engine) SyncOnce(ctx context.Context) error {
 	log.Println("sync: fetching contacts from Proton ...")
-	// proton.Bridge.ListCards returns []proton.CardObject
 	pCards, err := e.proton.ListCards(ctx)
 	if err != nil {
 		return fmt.Errorf("list proton: %w", err)
@@ -139,11 +182,9 @@ func (e *Engine) syncUID(
 
 	switch {
 	case pChanged && sChanged && !firstSeen:
-		// Both sides changed independently since the last sync — conflict.
 		return e.handleConflict(ctx, uid, pc, sc)
 
 	case (pChanged && !sChanged) || (inProton && !inSynology):
-		// Proton is newer or only exists on Proton — push to Synology.
 		log.Printf("sync: uid %s: Proton -> Synology", uid)
 		etag, err := e.synology.PutContact(ctx, uid, pc.VCard)
 		if err != nil {
@@ -154,9 +195,7 @@ func (e *Engine) syncUID(
 		})
 
 	case (sChanged && !pChanged) || (inSynology && !inProton):
-		// Synology is newer or only exists on Synology — push to Proton.
 		log.Printf("sync: uid %s: Synology -> Proton", uid)
-		// UpsertCardByVCard creates or updates on Proton side.
 		obj, _, err := e.proton.UpsertCardByVCard(ctx, uid+".vcf", sc.VCard)
 		if err != nil {
 			return fmt.Errorf("upsert proton: %w", err)
@@ -166,7 +205,6 @@ func (e *Engine) syncUID(
 		})
 
 	case !inProton && inSynology && !firstSeen:
-		// Deleted on Proton since last sync — propagate deletion to Synology.
 		log.Printf("sync: uid %s: deleted on Proton -> delete on Synology", uid)
 		if err := e.synology.DeleteContact(ctx, uid); err != nil {
 			return err
@@ -174,7 +212,6 @@ func (e *Engine) syncUID(
 		return e.cache.Delete(uid)
 
 	case inProton && !inSynology && !firstSeen:
-		// Deleted on Synology since last sync — propagate deletion to Proton.
 		log.Printf("sync: uid %s: deleted on Synology -> delete on Proton", uid)
 		if err := e.proton.DeleteCardByHref(ctx, pc.Href); err != nil {
 			return err
@@ -182,7 +219,6 @@ func (e *Engine) syncUID(
 		return e.cache.Delete(uid)
 
 	default:
-		// Nothing changed on either side.
 		return nil
 	}
 }
@@ -217,22 +253,18 @@ func (e *Engine) handleConflict(
 
 	default: // "duplicate"
 		log.Printf("sync: uid %s: conflict -> duplicate", uid)
-
-		// Create a duplicate of the Proton version on Synology.
 		pDupUID := uid + "-conflict-proton"
 		pDupVCard := appendConflictSuffix(pc.VCard, pDupUID, "-conflict-proton")
 		sETag1, err := e.synology.PutContact(ctx, pDupUID, pDupVCard)
 		if err != nil {
 			return fmt.Errorf("dup proton->synology: %w", err)
 		}
-		// Create a duplicate of the Synology version on Proton.
 		sDupUID := uid + "-conflict-synology"
 		sDupVCard := appendConflictSuffix(sc.VCard, sDupUID, "-conflict-synology")
 		pDupObj, _, err := e.proton.UpsertCardByVCard(ctx, sDupUID+".vcf", sDupVCard)
 		if err != nil {
 			return fmt.Errorf("dup synology->proton: %w", err)
 		}
-		// Cache both duplicates.
 		if err := e.cache.Upsert(cache.ContactState{
 			UID: pDupUID, ProtonETag: "", SynologyETag: sETag1, SyncedAt: time.Now(),
 		}); err != nil {
@@ -243,18 +275,15 @@ func (e *Engine) handleConflict(
 		}); err != nil {
 			return err
 		}
-		// Remove the original conflicting entry from the cache so the
-		// next sync treats the duplicates as canonical.
 		return e.cache.Delete(uid)
 	}
 }
 
-// appendConflictSuffix rewrites the UID and FN fields of a vCard to
-// mark it as a conflict copy.
+// appendConflictSuffix rewrites the UID and FN fields of a vCard to mark it
+// as a conflict copy.
 func appendConflictSuffix(vcBytes []byte, newUID, fnSuffix string) []byte {
 	card, err := vcard.NewDecoder(bytes.NewReader(vcBytes)).Decode()
 	if err != nil {
-		// If we cannot parse the vCard, return it unchanged with a header comment.
 		return vcBytes
 	}
 	card.SetValue(vcard.FieldUID, newUID)
