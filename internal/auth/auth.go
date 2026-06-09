@@ -31,9 +31,8 @@
 // Session persistence (hydroxide pattern):
 // Bootstrap performs the real Proton SRP login + optional TOTP and persists
 // the resulting Auth tokens (UID, AccessToken, RefreshToken) inside the
-// encrypted envelope. Subsequent sync/daemon runs call NewClientWithRefresh
-// using those tokens — TOTP is never required again unless the session is
-// revoked server-side.
+// encrypted envelope. Subsequent runs call NewClientWithRefresh using those
+// tokens — TOTP is never required again unless the session is revoked.
 package auth
 
 import (
@@ -56,7 +55,6 @@ import (
 const authFile = "auth.json"
 
 // ProtonAuthTokens holds the Proton session tokens needed for token refresh.
-// Stored inside the AES-256-GCM envelope so they survive process restarts.
 type ProtonAuthTokens struct {
 	UID          string `json:"UID"`
 	AccessToken  string `json:"AccessToken"`
@@ -76,8 +74,7 @@ type Config struct {
 	SyncIntervalSec         int               `json:"sync_interval_sec"`
 	ConflictPolicy          string            `json:"conflict_policy"`
 
-	// bridgePass is retained in memory so Save can re-encrypt without
-	// prompting again.
+	// bridgePass is retained in memory so Save can re-encrypt without prompting.
 	bridgePass string `json:"-"`
 }
 
@@ -88,11 +85,12 @@ type envelope struct {
 	Cipher             string `json:"cipher"`
 }
 
-// Bootstrap runs the interactive first-time setup, performs the real Proton
-// SRP login (+ TOTP if required), and writes auth.json with the resulting
-// session tokens persisted inside the encrypted envelope.
+// Bootstrap runs the interactive first-time setup: prompts for Proton
+// credentials + TOTP (if enabled), performs SRP login, persists the resulting
+// session tokens in an AES-256-GCM encrypted auth.json, and prints the
+// bridge password once.
 func Bootstrap() error {
-	fmt.Println("=== proton-sync auth bootstrap ===")
+	fmt.Println("=== proton-carddav auth bootstrap ===")
 
 	cfg := Config{
 		SyncIntervalSec: 300,
@@ -106,9 +104,8 @@ func Bootstrap() error {
 		cfg.ProtonMboxPass = mbox
 	}
 
-	// ── Perform real Proton login + TOTP now so tokens are persisted ──────
 	fmt.Println("\nAuthenticating with ProtonMail...")
-	_, auth, err := loginProton(context.Background(), &cfg)
+	auth, err := loginProton(context.Background(), &cfg)
 	if err != nil {
 		return fmt.Errorf("proton login: %w", err)
 	}
@@ -119,11 +116,13 @@ func Bootstrap() error {
 	}
 	fmt.Println("ProtonMail authentication successful.")
 
-	fmt.Println("\n--- Synology CardDAV ---")
+	fmt.Println("\n--- Synology CardDAV (optional — leave blank to skip) ---")
 	cfg.SynologyURL = prompt("Synology CardDAV URL (e.g. https://nas.example.org:5006): ", false)
-	cfg.SynologyUsername = prompt("Synology username: ", false)
-	cfg.SynologyPassword = prompt("Synology password: ", true)
-	cfg.SynologyAddressbookPath = prompt("Address book path (e.g. /carddav/principal/addressbooks/proton/): ", false)
+	if cfg.SynologyURL != "" {
+		cfg.SynologyUsername = prompt("Synology username: ", false)
+		cfg.SynologyPassword = prompt("Synology password: ", true)
+		cfg.SynologyAddressbookPath = prompt("Address book path (e.g. /carddav/principal/addressbooks/proton/): ", false)
+	}
 
 	bp, err := generateBridgePassword(32)
 	if err != nil {
@@ -131,7 +130,7 @@ func Bootstrap() error {
 	}
 
 	fmt.Printf("\n\033[1;33m⚠  Bridge password (save this — it cannot be recovered):\n\n   %s\n\n\033[0m", bp)
-	fmt.Println("Set BRIDGE_PASSWORD=<value> before running sync/daemon.")
+	fmt.Println("Set BRIDGE_PASSWORD=<value> before running serve.")
 	fmt.Println("TOTP will NOT be required on future runs — session is persisted.")
 
 	if err := writeEncrypted(cfg, bp); err != nil {
@@ -140,9 +139,9 @@ func Bootstrap() error {
 	return nil
 }
 
-// Load decrypts auth.json using the bridge password and returns the Config.
-// The bridge password is retained inside the returned Config so that
-// Save() can re-encrypt without prompting again.
+// Load decrypts auth.json using the bridge password (from BRIDGE_PASSWORD env
+// or interactive prompt) and returns the Config. The bridge password is
+// retained inside the Config so Save() can re-encrypt without prompting.
 func Load() (*Config, error) {
 	bp := os.Getenv("BRIDGE_PASSWORD")
 	if bp == "" {
@@ -156,10 +155,8 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// Save re-encrypts the Config (with updated ProtonAuth tokens) back to
-// auth.json using the bridge password that was supplied to Load.
-// Call this after every successful Proton connect to persist the new
-// refresh token issued by the server.
+// Save re-encrypts the Config back to auth.json using the bridge password
+// retained by Load. Call after any token refresh to keep auth.json current.
 func Save(cfg *Config) error {
 	if cfg.bridgePass == "" {
 		return errors.New("auth: cannot save — bridge password not set (was Load called?)")
@@ -167,42 +164,30 @@ func Save(cfg *Config) error {
 	return writeEncrypted(*cfg, cfg.bridgePass)
 }
 
-// loginProton is called by Bootstrap to perform SRP login + TOTP.
-// Imported here to avoid a circular dependency — the proton package imports
-// nothing from auth, so we call it via a function variable that engine.go
-// sets. For Bootstrap we use a local import.
-func loginProton(ctx context.Context, cfg *Config) (interface{ Close(context.Context) }, *protonapi.Auth, error) {
-	// Import inline to avoid circular dep — bridge package is a sibling.
-	// We use the go-proton-api Manager directly here.
+// loginProton performs SRP login + optional TOTP during bootstrap.
+// It returns only the *protonapi.Auth tokens needed for persistence.
+// The bootstrap client is deleted (logged out) via defer before returning.
+func loginProton(ctx context.Context, cfg *Config) (*protonapi.Auth, error) {
 	m := protonapi.New(
 		protonapi.WithAppVersion("go-proton-api"),
 	)
 
-	otpFn := func() string {
-		return prompt("TOTP code (press Enter if 2FA not enabled): ", false)
-	}
-
 	c, auth, err := m.NewClientWithLogin(ctx, cfg.ProtonUsername, []byte(cfg.ProtonPassword))
 	if err != nil {
-		return nil, nil, fmt.Errorf("SRP login: %w", err)
+		return nil, fmt.Errorf("SRP login: %w", err)
 	}
+	// The bootstrap client is only needed to complete 2FA and capture tokens.
+	// It is deleted here; subsequent runs use NewClientWithRefresh instead.
+	defer func() { _ = c.AuthDelete(ctx) }()
 
 	if auth.TwoFA.Enabled&protonapi.HasTOTP != 0 {
-		code := otpFn()
+		code := prompt("TOTP code: ", false)
 		if err := c.Auth2FA(ctx, protonapi.Auth2FAReq{TwoFactorCode: code}); err != nil {
-			return nil, nil, fmt.Errorf("2FA: %w", err)
+			return nil, fmt.Errorf("2FA: %w", err)
 		}
 	}
 
-	// Return a minimal closer wrapping the client.
-	type closer struct{ c *protonapi.Client }
-	return &struct {
-		closer
-		CloseFunc func(context.Context)
-	}{
-		closer:    closer{c},
-		CloseFunc: func(ctx context.Context) { _ = c.AuthDelete(ctx) },
-	}, &auth, nil
+	return &auth, nil
 }
 
 func writeEncrypted(cfg Config, bridgePass string) error {
@@ -254,7 +239,7 @@ func writeEncrypted(cfg Config, bridgePass string) error {
 func readEncrypted(bridgePass string) (*Config, error) {
 	data, err := os.ReadFile(authFile)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w (run 'proton-sync auth' first)", authFile, err)
+		return nil, fmt.Errorf("open %s: %w (run 'proton-carddav auth' first)", authFile, err)
 	}
 
 	var env envelope
