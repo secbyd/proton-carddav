@@ -13,10 +13,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 
+	protonapi "github.com/ProtonMail/go-proton-api"
 	vcard "github.com/emersion/go-vcard"
 
 	"github.com/secbyd/proton-carddav/internal/auth"
@@ -36,23 +36,35 @@ type Engine struct {
 // NewEngine authenticates with ProtonMail, opens the local sync cache, and
 // returns a ready Engine. It is the constructor used by cmd/proton-sync.
 //
-// Authentication uses proton.NewClientAndBridge which implements the correct
-// Proton SRP -> TOTP -> GetSalts -> SaltForKey -> Unlock sequence.
-// TOTP is read from the PROTON_TOTP environment variable when set; otherwise
-// the user is prompted interactively.
+// Session lifecycle:
+//  1. If cfg.ProtonAuth contains a valid UID + RefreshToken, a silent token
+//     refresh is attempted — no password or TOTP required.
+//  2. On refresh failure (expired/revoked) a full SRP login is performed.
+//     TOTP is prompted interactively in that case.
+//  3. The resulting (possibly new) Auth tokens are written back to auth.json
+//     so the next run can resume silently.
 func NewEngine(ctx context.Context, cfg *auth.Config) (*Engine, error) {
-	otpFn := func() string {
-		if v := os.Getenv("PROTON_TOTP"); v != "" {
-			return v
+	// Convert stored ProtonAuthTokens -> *protonapi.Auth for the bridge.
+	var existingAuth *protonapi.Auth
+	if cfg.ProtonAuth != nil && cfg.ProtonAuth.UID != "" {
+		existingAuth = &protonapi.Auth{
+			UID:          cfg.ProtonAuth.UID,
+			AccessToken:  cfg.ProtonAuth.AccessToken,
+			RefreshToken: cfg.ProtonAuth.RefreshToken,
 		}
+	}
+
+	// otpFn is only called on a full SRP login (refresh failed or first run).
+	otpFn := func() string {
 		fmt.Print("TOTP code: ")
 		var code string
 		fmt.Scanln(&code) //nolint:errcheck
 		return code
 	}
 
-	bridge, err := proton.NewClientAndBridge(
+	bridge, newAuth, err := proton.NewClientAndBridge(
 		ctx,
+		existingAuth,
 		cfg.ProtonUsername,
 		cfg.ProtonPassword,
 		cfg.ProtonMboxPass,
@@ -60,6 +72,18 @@ func NewEngine(ctx context.Context, cfg *auth.Config) (*Engine, error) {
 	)
 	if err != nil {
 		return nil, fmt.Errorf("proton auth: %w", err)
+	}
+
+	// Persist the (possibly refreshed) tokens so the next run is silent.
+	cfg.ProtonAuth = &auth.ProtonAuthTokens{
+		UID:          newAuth.UID,
+		AccessToken:  newAuth.AccessToken,
+		RefreshToken: newAuth.RefreshToken,
+	}
+	if saveErr := auth.Save(cfg); saveErr != nil {
+		// Non-fatal: log and continue. The session is live; the next run will
+		// just fall back to a full login again.
+		log.Printf("warning: could not persist updated auth tokens: %v", saveErr)
 	}
 
 	policy := cfg.ConflictPolicy

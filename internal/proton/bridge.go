@@ -15,6 +15,11 @@
 //
 //  3. Cards.Merge(*crypto.KeyRing) decrypts + verifies all card types and
 //     returns a merged vcard.Card ready for re-serialisation.
+//
+//  4. Session persistence (hydroxide pattern):
+//     Pass an existing *protonapi.Auth to NewClientAndBridge to attempt a
+//     silent token refresh (NewClientWithRefresh). TOTP is only required
+//     on the very first login or after a session is revoked server-side.
 package proton
 
 import (
@@ -24,6 +29,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -61,85 +67,118 @@ type Bridge struct {
 	keyring *crypto.KeyRing
 }
 
-// NewClientAndBridge performs full SRP login, optional TOTP 2FA, key-salt
-// derivation, and keyring unlock. It returns a ready-to-use Bridge.
+// NewManager returns a configured go-proton-api Manager.
+// Using the library default app version "go-proton-api" which is accepted
+// by Proton's AuthInfo endpoint. "Other/1.0" was previously used here but
+// caused AuthInfo to return an error response, leaving Modulus nil and
+// triggering a nil pointer dereference in srp.NewAuth.
+func NewManager() *protonapi.Manager {
+	return protonapi.New(
+		protonapi.WithAppVersion("go-proton-api"),
+	)
+}
+
+// NewClientAndBridge establishes an authenticated Proton session and returns
+// a ready Bridge plus the Auth tokens to be persisted for the next run.
+//
+// Session lifecycle (hydroxide pattern):
+//  1. If existingAuth is non-nil and has a UID, attempt a silent token refresh
+//     via NewClientWithRefresh — no password or TOTP needed.
+//  2. If refresh fails (expired, revoked) or existingAuth is nil, fall back
+//     to a full SRP login + optional TOTP.
 //
 // Parameters:
-//   - username     Proton account username
-//   - password     Proton login password
-//   - mboxPass     Mailbox password (pass empty string for single-password mode)
-//   - otpFn        Called when Proton requires TOTP; may be nil in daemon mode
-//     (will fail if 2FA is actually required when nil)
+//   - existingAuth  Previously persisted Auth tokens; nil on first run.
+//   - username      Proton account username (used for full login fallback).
+//   - password      Proton login password (used for full login fallback).
+//   - mboxPass      Mailbox password; empty string means single-password mode.
+//   - otpFn         Called only when Proton requires TOTP during a full login.
+//     May be nil if existingAuth is always valid (daemon mode without
+//     re-auth). Will error if TOTP is required and otpFn is nil.
 func NewClientAndBridge(
 	ctx context.Context,
+	existingAuth *protonapi.Auth,
 	username, password, mboxPass string,
 	otpFn func() string,
-) (*Bridge, error) {
-	m := protonapi.New(
-		protonapi.WithHostURL("https://mail.proton.me"),
-		protonapi.WithAppVersion("Other/1.0"),
+) (*Bridge, *protonapi.Auth, error) {
+	m := NewManager()
+
+	var (
+		c    *protonapi.Client
+		auth protonapi.Auth
+		err  error
 	)
 
-	// ── Step 1: SRP login ──
-	c, auth, err := m.NewClientWithLogin(ctx, username, []byte(password))
-	if err != nil {
-		return nil, fmt.Errorf("proton: SRP login: %w", err)
+	// ── Attempt silent token refresh first ────────────────────────────────
+	if existingAuth != nil && existingAuth.UID != "" {
+		c, auth, err = m.NewClientWithRefresh(ctx, existingAuth.UID, existingAuth.RefreshToken)
+		if err == nil {
+			log.Println("proton: session resumed via token refresh")
+			goto unlock
+		}
+		log.Printf("proton: token refresh failed (%v) — falling back to full login", err)
 	}
 
-	// ── Step 2: TOTP 2FA (if required) ──
-	// auth.TwoFA.Enabled is a bitmask: HasTOTP = 1<<0, HasFIDO2 = 1<<1.
-	if auth.TwoFA.Enabled&protonapi.HasTOTP != 0 {
-		if otpFn == nil {
-			return nil, errors.New("proton: TOTP required but no OTP function provided")
+	// ── Full SRP login ────────────────────────────────────────────────────
+	{
+		c, auth, err = m.NewClientWithLogin(ctx, username, []byte(password))
+		if err != nil {
+			return nil, nil, fmt.Errorf("proton: SRP login: %w", err)
 		}
-		if err := c.Auth2FA(ctx, protonapi.Auth2FAReq{
-			TwoFactorCode: otpFn(),
-		}); err != nil {
-			return nil, fmt.Errorf("proton: 2FA: %w", err)
+
+		// TOTP 2FA — auth.TwoFA.Enabled is a bitmask: HasTOTP = 1<<0.
+		if auth.TwoFA.Enabled&protonapi.HasTOTP != 0 {
+			if otpFn == nil {
+				return nil, nil, errors.New(
+					"proton: TOTP required but no OTP function provided — " +
+						"run 'proton-sync auth' to bootstrap a fresh session")
+			}
+			if err := c.Auth2FA(ctx, protonapi.Auth2FAReq{
+				TwoFactorCode: otpFn(),
+			}); err != nil {
+				return nil, nil, fmt.Errorf("proton: 2FA: %w", err)
+			}
 		}
 	}
 
-	// ── Step 3: Fetch user + addresses ──
+unlock:
+	// ── Fetch user + addresses ────────────────────────────────────────────
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("proton: get user: %w", err)
+		return nil, nil, fmt.Errorf("proton: get user: %w", err)
 	}
 	if len(user.Keys) == 0 {
-		return nil, errors.New("proton: user has no keys")
+		return nil, nil, errors.New("proton: user has no keys")
 	}
 
 	addresses, err := c.GetAddresses(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("proton: get addresses: %w", err)
+		return nil, nil, fmt.Errorf("proton: get addresses: %w", err)
 	}
 
-	// ── Step 4: Derive salted mailbox password ──
-	// In single-password mode, the mailbox password equals the login password.
+	// ── Derive salted mailbox password ────────────────────────────────────
+	// Single-password mode: mailbox password == login password.
 	if mboxPass == "" {
 		mboxPass = password
 	}
 
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("proton: get salts: %w", err)
+		return nil, nil, fmt.Errorf("proton: get salts: %w", err)
 	}
 
-	// SaltForKey uses the primary key ID to look up the correct salt entry
-	// and applies Proton's bcrypt-derived MailboxPassword KDF.
 	saltedPass, err := salts.SaltForKey([]byte(mboxPass), user.Keys[0].ID)
 	if err != nil {
-		return nil, fmt.Errorf("proton: salt key pass: %w", err)
+		return nil, nil, fmt.Errorf("proton: salt key pass: %w", err)
 	}
 
-	// ── Step 5: Unlock keyring ──
-	// proton.Unlock returns the user keyring and per-address keyrings.
-	// We only need the user keyring for contact decryption.
+	// ── Unlock keyring ────────────────────────────────────────────────────
 	userKR, _, err := protonapi.Unlock(user, addresses, saltedPass)
 	if err != nil {
-		return nil, fmt.Errorf("proton: unlock keyring: %w", err)
+		return nil, nil, fmt.Errorf("proton: unlock keyring: %w", err)
 	}
 
-	return &Bridge{client: c, keyring: userKR}, nil
+	return &Bridge{client: c, keyring: userKR}, &auth, nil
 }
 
 // NewBridge constructs a Bridge from an already-authenticated client and keyring.
